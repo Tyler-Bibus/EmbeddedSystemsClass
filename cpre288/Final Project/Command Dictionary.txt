@@ -1,0 +1,43 @@
+**** Command Dictionary for the CyBot-GUI communication ****
+
+### ALL COMMANDS END WITH A "d\n" TO SIGNAL THE COMMAND FINISHED ###
+
+Section 1: Movement
+Move command: moves forward or backwards cm degrees
+	m (signed float cm)
+	ex: m 25.0 //this will move 25 cm
+	if no bump/hole, return: just "d\n"
+	if bump, return : "b (1/2) (float distance remaining)", 1/2 signals left/right, distance remaining is the distance left in cm
+	if hole, return : "h (1/2) (float distance remaining)", 1/2 signals left/right, distance remaining is the distance left in cm
+	
+Turn command: turns left or right deg degrees
+	t (signed float deg) //will be converted by cybot to int for turns
+	ex: t -30 //this will turn CCW 30 deg
+	return: "d\n"
+	
+	
+Section 2: Object Detection
+Scan: Full 180 Degree Scan TODO: clean before or after?
+	s
+	return format for each object:
+	(int angle) (float distance cm) (float size cm)
+	final return
+	"d\n" //This done will tell the GUI when the scan is completed
+	example return: "2 20.0 4.3\n" "d\n"
+	
+Ping (Unused): Pings at 90 degrees
+	p 
+	return: "(float distance cm)\n"
+	
+Section 3: Misc
+
+Orchestrate: Sings a song until done or hits max Time
+	o (int maxTimeSeconds)
+	returns: "d\n"
+	
+Flush: Flushes out the backed up responses from the cybot
+	"f\n"
+	return: "f\n" AND THEN "d\n" (both)
+	the f allows us to know when we are caught up, then read one more for the d\n
+	
+	

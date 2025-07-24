@@ -1,0 +1,10 @@
+"./Timer.obj"
+"./lab9part1.obj"
+"./lab9part2.obj"
+"./lab9part3.obj"
+"./lcd.obj"
+"./ping.obj"
+"./tm4c123gh6pm_startup_ccs.obj"
+"../tm4c123gh6pm.cmd"
+-llibc.a
+-l"C:/ti/TivaWare_C_Series-2.2.0.295/driverlib/ccs/Debug/driverlib.lib"
