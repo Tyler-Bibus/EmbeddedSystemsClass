@@ -11,9 +11,9 @@
 
 void cleanData(float uncleanData[], char message[], scan_data *data){
     //First, remove/smooth outliers, assume all values are positive
-    char i;
-    char j;
-    char k;
+    int i;
+    int j;
+    int k;
     float bounds = 5; //max variation of 5cm (could maybe make more conservative?)
     char object = 0; //boolean
     float MAX_RANGE = 63.0;
@@ -49,10 +49,10 @@ void cleanData(float uncleanData[], char message[], scan_data *data){
 }
 
 void objectDetection(float distances[], char message[], scan_data *data){
-    char i;
+    int i;
     //char object = 0; //keep if we want to keep track of # of objects
-    char startAngle = 0;
-    char endAngle = 0;
+    int startAngle = 0;
+    int endAngle = 0;
     float objectDistance = 0;
     float objectSize = 0;
     for (i = 3; i < 90 - 1; i++){
@@ -60,7 +60,11 @@ void objectDetection(float distances[], char message[], scan_data *data){
         if ((distances[i] < 65.0) && (distances[i-1] - distances[i]) > 1.0){
             startAngle = i * 2;
             endAngle = startAngle;
-            while(fabs(distances[i] - distances[i+1]) < 1.0 || (distances[i] - distances[i+1]) > 1.0){
+            // Bound the walk: 0..180 degrees is 91 samples, and i+1 must stay
+            // inside the array even when an object runs to the edge of the scan.
+            while ((i < 88) &&
+                   (fabs(distances[i] - distances[i+1]) < 1.0 ||
+                    (distances[i] - distances[i+1]) > 1.0)){
                 i++;
             }
             endAngle = i * 2;
@@ -71,6 +75,10 @@ void objectDetection(float distances[], char message[], scan_data *data){
             scan((startAngle + endAngle)/2 , data);
             scan((startAngle + endAngle)/2 , data);
             objectDistance = data->sound_dist;
+            // 0xFFFFFF marks a ping timeout; ignore impossible distances.
+            if (objectDistance <= 0.0 || objectDistance > 100.0){
+                continue;
+            }
             objectSize = tan((((endAngle - startAngle) * M_PI) / 180.0) / 2.0) * objectDistance * 2; //I hate this equation (size)
             //if object size smaller than 3 ignore
             if (objectSize <= 3.0){

@@ -12,9 +12,11 @@
 void move_forward(oi_t* sensor, int distance, char message[]){
     double sum = 0;
     int encounter = 0;
+    int timed_out = 0;
+    unsigned long guard = 0;
     oi_setWheels(130,130); //1/5 speed ahead!
     //go fast until within 10cm
-    while(sum < distance - 100){
+    while(sum < distance - 100 && guard++ < 200000UL){
         oi_update(sensor);
         sum += sensor->distance; //integrates distance
         if(sensor->bumpLeft){
@@ -38,8 +40,12 @@ void move_forward(oi_t* sensor, int distance, char message[]){
             break;
         }
     }
+    if (guard >= 200000UL){
+        timed_out = 1;
+    }
     //last 10ish cm go slow
-    while(sum < distance && encounter == 0){
+    guard = 0;
+    while(sum < distance && encounter == 0 && guard++ < 200000UL){
         oi_setWheels(50,50);
         oi_update(sensor);
         sum += sensor->distance; //integrates distance
@@ -66,7 +72,16 @@ void move_forward(oi_t* sensor, int distance, char message[]){
         }
     }
     oi_setWheels(0,0); //stops bot
+    if (guard >= 200000UL){
+        timed_out = 1;
+    }
+    if (timed_out && encounter == 0){
+        encounter = 5; // timed out: report a boundary-style remaining distance
+    }
     float offDistance = (distance - sum) / 10;
+    if (offDistance < 0){
+        offDistance = 0;
+    }
     //determine if bump happened, and the distance remaining
     switch(encounter){
     case 0:
@@ -99,9 +114,10 @@ void move_forward(oi_t* sensor, int distance, char message[]){
 //Moves backwards pretty slowly
 void move_backwards(oi_t* sensor, int distance, char message[]){
     double sum = 0;
+    unsigned long guard = 0;
     oi_setWheels(-50,-50); //1/5 speed ahead!
     distance = distance * -1; //makes distance negative for while loop
-    while(sum > distance){
+    while(sum > distance && guard++ < 200000UL){
         oi_update(sensor);
         sum += sensor->distance; //integrates distance
     }
@@ -112,17 +128,19 @@ void move_backwards(oi_t* sensor, int distance, char message[]){
 
 void turn_counterclock(oi_t* sensor, int degrees){
     double sum = 0;
+    unsigned long guard = 0;
 
-    oi_setWheels(75,-75); //turn clockwise slow
+    oi_setWheels(75,-75); //right forward, left back: counter-clockwise
 
-    while(sum < degrees - 15){
+    while(sum < degrees - 15 && guard++ < 20000UL){
         oi_update(sensor);
         sum += sensor->angle;
     }
 
     oi_setWheels(20,-20);
     //-2 for integration overshoot
-    while(sum < (float)degrees - 0.5){
+    guard = 0;
+    while(sum < (float)degrees - 0.5 && guard++ < 20000UL){
         oi_update(sensor);
         sum += sensor->angle;
     }
@@ -132,18 +150,20 @@ void turn_counterclock(oi_t* sensor, int degrees){
 
 void turn_clockwise(oi_t* sensor, int degrees){
     double sum = 0;
+    unsigned long guard = 0;
 
-    oi_setWheels(-75,75); //turn clockwise slow
+    oi_setWheels(-75,75); //right back, left forward: clockwise
     degrees = degrees * -1;
 
-    while(sum > degrees + 15){
+    while(sum > degrees + 15 && guard++ < 20000UL){
         oi_update(sensor);
         sum += sensor->angle;
     }
 
     oi_setWheels(-20,20);
     //+2 degrees for integration overshoot
-    while(sum > (float)degrees + 0.5){
+    guard = 0;
+    while(sum > (float)degrees + 0.5 && guard++ < 20000UL){
         oi_update(sensor);
         sum += sensor->angle;
     }

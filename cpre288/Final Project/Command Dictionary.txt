@@ -7,8 +7,8 @@ Move command: moves forward or backwards cm degrees
 	m (signed float cm)
 	ex: m 25.0 //this will move 25 cm
 	if no bump/hole, return: just "d\n"
-	if bump, return : "b (1/2) (float distance remaining)", 1/2 signals left/right, distance remaining is the distance left in cm
-	if hole, return : "h (1/2) (float distance remaining)", 1/2 signals left/right, distance remaining is the distance left in cm
+	if bump, return : "b (float distance remaining)", distance remaining is the distance left in cm
+	if hole, return : "h (float distance remaining)", distance remaining is the distance left in cm
 	
 Turn command: turns left or right deg degrees
 	t (signed float deg) //will be converted by cybot to int for turns
@@ -31,8 +31,9 @@ Ping (Unused): Pings at 90 degrees
 	
 Section 3: Misc
 
-Orchestrate: Sings a song until done or hits max Time
-	o (int maxTimeSeconds)
+Orchestrate: plays a loaded song by index
+	o (int songIndex)
+	0 = Rango, 1 = Funkytown
 	returns: "d\n"
 	
 Flush: Flushes out the backed up responses from the cybot

@@ -9,8 +9,9 @@
 #include "comms.h"
 #include <stdio.h>
 
-#define SPEED_SOUND 34.0
-#define TIME_PER_CLOCK 0.0000625
+// Timer3B is the 16 MHz system clock divided by (TBPR + 1) = 256.
+#define TIMER_COUNTS_PER_SECOND 62500.0
+#define SPEED_SOUND_CM_S 34000.0
 
 typedef struct{
     float sound_dist;
@@ -29,7 +30,8 @@ void scan(float angle, scan_data *data){
     servo_move(angle);
     data->ir_Raw = adc_read();
     unsigned int travel_time = ping_read();
-    data->sound_dist = ((travel_time * TIME_PER_CLOCK) * SPEED_SOUND) / 2.0;
+    data->sound_dist = ((travel_time / TIMER_COUNTS_PER_SECOND)
+                        * SPEED_SOUND_CM_S) / 2.0;
 }
 
 //gets raw IR data

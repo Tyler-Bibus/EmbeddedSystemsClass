@@ -67,11 +67,15 @@ DEFAULT_HOST = "192.168.1.1"
 DEFAULT_PORT = 288
 DEFAULT_BAUD = 115200
 
+SONG_RANGO = 0
+SONG_FUNKYTOWN = 1
+SONG_NAMES = {SONG_RANGO: "Rango", SONG_FUNKYTOWN: "Funkytown"}
+
 ROBOT_RADIUS = 0.19          # m, CyBot / Create 2
 SERVO_RADIUS = 0.14          # m, ping/servo sits ahead of the wheel centre
 FIELD_HALF = 3.0             # m, mapped square is +/- 3 m
 GRID_SPACING = 0.24          # m, A* lattice pitch
-MAP_BOUND = 660              # px
+MAP_BOUND = 600              # px
 PPM = MAP_BOUND / (2 * FIELD_HALF)  # pixels per metre
 SCAN_RANGE_M = 0.65          # firmware ignores IR returns beyond ~63 cm
 MAX_MOVE_CM = 500.0
@@ -181,8 +185,11 @@ class Obstacle:
     x: float
     y: float
     r: float
-    kind: str = "obstacle"  # obstacle | hole | boundary
+    kind: str = "obstacle"  # obstacle | bump | hole | boundary
     hits: int = 1
+    id: int = 0
+    added_turn: int = 0
+    updated_turn: int = 0
 
 
 @dataclass
@@ -366,6 +373,7 @@ class MapModel:
 
     def __init__(self) -> None:
         self.obstacles: list[Obstacle] = []
+        self._next_id = 1
         self.nodes: list[tuple[float, float]] = []
         self.ij: list[tuple[int, int]] = []
         self.node_index: dict[tuple[int, int], int] = {}
@@ -382,41 +390,136 @@ class MapModel:
 
     def clear(self) -> None:
         self.obstacles.clear()
+        self._next_id = 1
 
-    def _merge(self, new: Obstacle) -> None:
+    def _merge(self, new: Obstacle, average: bool = False,
+               turn: int = 0) -> bool:
+        """Merge into a nearby object; returns True when a new object was added."""
         for o in self.obstacles:
             if o.kind != new.kind:
                 continue
-            if math.hypot(o.x - new.x, o.y - new.y) < max(0.10, 0.45 * (o.r + new.r)):
+            if math.hypot(o.x - new.x, o.y - new.y) < max(0.12, 0.45 * (o.r + new.r)):
                 w = 1.0 / (o.hits + 1)
                 o.x = o.x * (1.0 - w) + new.x * w
                 o.y = o.y * (1.0 - w) + new.y * w
-                o.r = max(o.r, new.r)
+                if average:
+                    o.r = clamp(o.r * (1.0 - w) + new.r * w, 0.03, 0.32)
+                else:
+                    o.r = max(o.r, new.r)
                 o.hits += 1
-                return
+                o.updated_turn = max(o.updated_turn, turn)
+                return False
+        new.id = self._next_id
+        self._next_id += 1
+        new.added_turn = turn
+        new.updated_turn = turn
         self.obstacles.append(new)
+        return True
 
-    def add_detections(self, detections: list[Detection], pose: Pose) -> int:
-        """Project cleaned scan objects into the world using the current pose."""
+    def _near_contact(self, landmark: Obstacle) -> bool:
+        """Do not duplicate a physical object already recorded by contact."""
+        for o in self.obstacles:
+            if o.kind == "obstacle":
+                continue
+            if math.hypot(o.x - landmark.x, o.y - landmark.y) < o.r + landmark.r + 0.06:
+                return True
+        return False
+
+    def _add_landmarks(self, landmarks: list[Obstacle], turn: int,
+                       average: bool) -> int:
         added = 0
-        for landmark in detections_to_landmarks(detections, pose):
-            before = len(self.obstacles)
-            self._merge(landmark)
-            if len(self.obstacles) > before:
+        for landmark in landmarks:
+            if self._near_contact(landmark):
+                continue
+            if self._merge(landmark, average=average, turn=turn):
                 added += 1
         return added
 
-    def add_contact(self, pose: Pose, event: str) -> None:
+    def add_detections(self, detections: list[Detection], pose: Pose,
+                       turn: int = 0, average: bool = False) -> int:
+        """Project cleaned scan objects into the world using the current pose."""
+        return self._add_landmarks(
+            detections_to_landmarks(detections, pose), turn, average
+        )
+
+    def _in_scan_area(self, o: Obstacle, pose: Pose) -> bool:
+        sx = pose.x + SERVO_RADIUS * math.cos(math.radians(pose.heading))
+        sy = pose.y + SERVO_RADIUS * math.sin(math.radians(pose.heading))
+        dx, dy = o.x - sx, o.y - sy
+        dist = math.hypot(dx, dy)
+        if dist - o.r > SCAN_RANGE_M + 0.18:
+            return False
+        bearing = math.degrees(math.atan2(dy, dx))
+        return abs(wrap180(bearing - pose.heading)) <= 95.0
+
+    def refresh_scan(self, pose: Pose, detections: list[Detection],
+                     turn: int, average: bool = False) -> tuple[int, list[int]]:
+        """Replace the scan-derived objects in the viewed sector.
+
+        Contact objects (bump/hole/boundary) are never removed by a scan. Existing
+        scan objects that are re-seen are merged (position/size averaged when the
+        robot has not moved); objects in the sector that are not re-seen are
+        deleted as stale. Returns (new_objects, removed_ids).
+        """
+        landmarks = detections_to_landmarks(detections, pose)
+        removed: list[int] = []
+        for o in list(self.obstacles):
+            if o.kind != "obstacle" or not self._in_scan_area(o, pose):
+                continue
+            if any(math.hypot(o.x - lm.x, o.y - lm.y)
+                   < max(0.12, 0.45 * (o.r + lm.r)) for lm in landmarks):
+                continue
+            removed.append(o.id)
+            self.obstacles.remove(o)
+        added = self._add_landmarks(landmarks, turn, average)
+        return added, removed
+
+    def remove_near(self, x: float, y: float, radius: float,
+                    kinds: tuple[str, ...] = ("obstacle",)) -> list[int]:
+        removed: list[int] = []
+        for o in list(self.obstacles):
+            if o.kind in kinds and math.hypot(o.x - x, o.y - y) <= radius:
+                removed.append(o.id)
+                self.obstacles.remove(o)
+        return removed
+
+    def remove_ids(self, ids: list[int]) -> tuple[list[int], list[int]]:
+        wanted: list[int] = []
+        for raw in ids:
+            try:
+                wanted.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        removed: list[int] = []
+        ignored: list[int] = []
+        for oid in wanted:
+            target = next((o for o in self.obstacles if o.id == oid), None)
+            if target is None:
+                ignored.append(oid)
+            else:
+                removed.append(oid)
+                self.obstacles.remove(target)
+        return removed, ignored
+
+    def add_contact(self, pose: Pose, event: str, turn: int = 0) -> None:
         """A bump/hole/boundary contact is a known obstacle just ahead."""
         angle = pose.heading
         ox = pose.x + (ROBOT_RADIUS + 0.05) * math.cos(math.radians(angle))
         oy = pose.y + (ROBOT_RADIUS + 0.05) * math.sin(math.radians(angle))
+        # A contact refreshes the immediate area; scan-derived ghosts and an
+        # older contact of the same kind near the bumper are not trustworthy.
+        kinds = ["obstacle", "bump"]
         if event == "h":
-            self._merge(Obstacle(ox, oy, 0.10, "hole"))
+            kinds.append("hole")
         elif event == "w":
-            self._merge(Obstacle(ox, oy, 0.12, "boundary"))
+            kinds.append("boundary")
+        self.remove_near(ox, oy, 0.40, tuple(kinds))
+        if event == "h":
+            self._merge(Obstacle(ox, oy, 0.10, "hole"), turn=turn)
+        elif event == "w":
+            self._merge(Obstacle(ox, oy, 0.12, "boundary"), turn=turn)
         else:
-            self._merge(Obstacle(ox, oy, 0.07, "obstacle"))
+            self._merge(Obstacle(ox, oy, 0.07, "bump"), turn=turn)
 
     # -- planning ----------------------------------------------------------
 
@@ -537,11 +640,15 @@ class MapModel:
             prev = p
         return Route(targets, distance)
 
-    def snapshot(self, limit: int = 60) -> list[dict[str, Any]]:
-        items = sorted(self.obstacles, key=lambda o: -o.hits)[:limit]
+    def snapshot(self, limit: int = 60,
+                 current_turn: int = 0) -> list[dict[str, Any]]:
+        items = sorted(self.obstacles, key=lambda o: o.id)[:limit]
         return [
-            {"x": round(o.x, 2), "y": round(o.y, 2),
-             "r": round(o.r, 2), "kind": o.kind}
+            {"id": o.id, "x": round(o.x, 2), "y": round(o.y, 2),
+             "r": round(o.r, 2), "kind": o.kind, "hits": o.hits,
+             "added_turn": o.added_turn,
+             "updated_turn": o.updated_turn,
+             "age_turns": max(0, current_turn - o.added_turn)}
             for o in items
         ]
 
@@ -600,7 +707,7 @@ class ScanLocalizer:
                 landmarks: list[Obstacle]) -> tuple[Pose, Correction]:
         corr = Correction()
         obstacles = [o for o in landmarks
-                     if o.kind in ("obstacle", "boundary")]
+                     if o.kind in ("obstacle", "bump", "boundary")]
         if len(obstacles) < 2 or not detections:
             corr.note = "not enough mapped landmarks"
             return pose.copy(), corr
@@ -686,6 +793,8 @@ class RobotState:
         self.trail: list[tuple[float, float]] = [(0.0, 0.0)]
         self.last_scan: list[Detection] = []
         self.last_scan_landmarks: list[Obstacle] = []
+        self.last_scan_pose: Optional[Pose] = None
+        self.last_scan_turn: int = -1
         self.last_correction = Correction()
         self.last_event: Optional[str] = None
         self.connected = False
@@ -700,6 +809,8 @@ class RobotState:
             self.trail = [(0.0, 0.0)]
             self.last_scan = []
             self.last_scan_landmarks = []
+            self.last_scan_pose = None
+            self.last_scan_turn = -1
             self.last_correction = Correction()
             self.last_event = None
 
@@ -1063,10 +1174,15 @@ class SimLink:
 
         if code == "o":
             try:
-                seconds = float(arg)
+                index = int(float(arg))
             except ValueError:
-                seconds = 0.0
-            time.sleep(min(max(seconds, 0.0), 3.0))
+                index = 0
+            if index == SONG_RANGO:
+                time.sleep(2.2)
+            elif index == SONG_FUNKYTOWN:
+                time.sleep(3.0)
+            else:
+                time.sleep(1.0)
             return ["d"]
 
         if code == "f":
@@ -1098,6 +1214,7 @@ class CybotController:
         self.cmd_lock = threading.RLock()
         self.localizer = ScanLocalizer()
         self.last_turn: Optional[dict[str, float]] = None
+        self.turn_count = 0
         state.connected = True
         state.mode = getattr(link, "mode", "unknown")
 
@@ -1155,6 +1272,7 @@ class CybotController:
                 self._link_failed(str(exc))
                 return {"ok": False, "error": str(exc)}
 
+            self.turn_count += 1
             event, remaining = self._event_of(response)
             if event is not None and remaining is not None and distance_cm > 0:
                 travelled = (sent_cm - remaining) * scale
@@ -1167,7 +1285,8 @@ class CybotController:
                 self.state.pose.x += ux * travelled / 100.0
                 self.state.pose.y += uy * travelled / 100.0
                 if event is not None:
-                    self.state.map.add_contact(self.state.pose, event)
+                    self.state.map.add_contact(self.state.pose, event,
+                                               self.turn_count)
                     self.state.route = Route()
                     self.state.last_event = event
                 else:
@@ -1185,6 +1304,7 @@ class CybotController:
                 "pose": {"x": round(pose_now.x, 3), "y": round(pose_now.y, 3),
                          "heading_deg": round(pose_now.heading, 2)},
                 "mapped_obstacles": obstacles,
+                "turn_count": self.turn_count,
                 "response": response.replace("\n", " | "),
             }
 
@@ -1208,6 +1328,7 @@ class CybotController:
                 self._link_failed(str(exc))
                 return {"ok": False, "error": str(exc)}
             applied = -sent * scale
+            self.turn_count += 1
             with self.state.lock:
                 self.state.pose.heading = wrap360(self.state.pose.heading + applied)
                 self.state.add_trail_point()
@@ -1225,6 +1346,7 @@ class CybotController:
                 "applied_deg": round(applied, 2),
                 "pose": {"x": round(pose_now.x, 3), "y": round(pose_now.y, 3),
                          "heading_deg": round(pose_now.heading, 2)},
+                "turn_count": self.turn_count,
                 "response": response.replace("\n", " | "),
             }
 
@@ -1254,6 +1376,13 @@ class CybotController:
                 previous_landmarks = list(self.state.last_scan_landmarks)
                 mapped_landmarks = list(self.state.map.obstacles)
                 previous_detections = list(self.state.last_scan)
+                last_pose = self.state.last_scan_pose
+                same_pose = (
+                    last_pose is not None
+                    and self.state.last_scan_turn == self.turn_count
+                    and math.hypot(pose.x - last_pose.x, pose.y - last_pose.y) < 0.03
+                    and abs(wrap180(pose.heading - last_pose.heading)) < 3.0
+                )
 
             # In-place turn calibration: a scan right after a turn gives a pure
             # rotation, so overlapping objects measure the encoder's real angle.
@@ -1326,11 +1455,15 @@ class CybotController:
 
             with self.state.lock:
                 self.state.pose = corrected
-                added = self.state.map.add_detections(detections, corrected)
+                added, removed = self.state.map.refresh_scan(
+                    corrected, detections, self.turn_count, average=same_pose
+                )
                 self.state.last_scan = detections
                 self.state.last_scan_landmarks = detections_to_landmarks(
                     detections, corrected
                 )
+                self.state.last_scan_pose = corrected.copy()
+                self.state.last_scan_turn = self.turn_count
                 self.state.last_correction = correction
                 if self.state.goal is not None:
                     self.state.route = self.state.map.plan(
@@ -1345,73 +1478,17 @@ class CybotController:
                 "detections": [d.as_dict() for d in detections[:40]],
                 "detection_count": len(detections),
                 "new_obstacles": added,
+                "removed_obstacles": len(removed),
+                "removed_ids": removed,
+                "same_pose_merge": same_pose,
                 "mapped_obstacles": total,
+                "turn_count": self.turn_count,
                 "correction": correction.as_dict(),
                 "turn_calibration": turn_calibration,
                 "turn_scale": round(self.config.turn_scale, 4),
                 "pose": {"x": round(pose_now.x, 3), "y": round(pose_now.y, 3),
                          "heading_deg": round(pose_now.heading, 2)},
                 "route": route,
-            }
-
-    def survey(self) -> dict[str, Any]:
-        """Scan eight overlapping sectors (45-degree turns) and return to start.
-
-        Forty-five degree steps keep ~135 degrees of overlap between consecutive
-        scans, which lets the turn estimator measure real rotation instead of
-        baking encoder error into the map.
-        """
-        with self.cmd_lock:
-            start_heading = self._pose().heading
-            scans: list[dict[str, Any]] = []
-            for i in range(8):
-                if self.stop_event is not None and self.stop_event.is_set():
-                    return {"ok": False, "error": "operator stopped the agent",
-                            "scans": scans}
-                result = self.scan()
-                if not result.get("ok"):
-                    return {"ok": False, "error": result.get("error"),
-                            "scans": scans}
-                scans.append({
-                    "index": i,
-                    "detections": result["detection_count"],
-                    "correction": result["correction"],
-                    "turn_calibration": result.get("turn_calibration"),
-                })
-                if i < 7:
-                    turn = self.turn_ccw(45.0)
-                    if not turn.get("ok"):
-                        return {"ok": False, "error": turn.get("error"),
-                                "scans": scans}
-            # Return to the original heading and take one final correction scan.
-            pose = self._pose()
-            back = wrap180(start_heading - pose.heading)
-            if abs(back) > 0.75:
-                turn = self.turn_ccw(back)
-                if not turn.get("ok"):
-                    return {"ok": False, "error": turn.get("error"),
-                            "scans": scans}
-            final = self.scan()
-            if final.get("ok"):
-                scans.append({
-                    "index": 8,
-                    "detections": final["detection_count"],
-                    "correction": final["correction"],
-                    "turn_calibration": final.get("turn_calibration"),
-                })
-            with self.state.lock:
-                pose_now = self.state.pose.copy()
-                total = len(self.state.map.obstacles)
-                corr = self.state.last_correction
-            self._dirty()
-            return {
-                "ok": True,
-                "scans": scans,
-                "detection_count": sum(s["detections"] for s in scans),
-                "mapped_obstacles": total,
-                "final_correction": corr.as_dict(),
-                "pose": {"x": round(pose_now.x, 3), "y": round(pose_now.y, 3),
-                         "heading_deg": round(pose_now.heading, 2)},
             }
 
     def set_goal(self, x: float, y: float) -> dict[str, Any]:
@@ -1435,7 +1512,8 @@ class CybotController:
                 "route": snapshot,
                 "pose": {"x": round(pose.x, 3), "y": round(pose.y, 3),
                          "heading_deg": round(pose.heading, 2)},
-                "obstacles": self.state.map.snapshot(20),
+                "obstacles": self.state.map.snapshot(20, self.turn_count),
+                "turn_count": self.turn_count,
                 "error": None if route.points else "no collision-free route with current map",
             }
 
@@ -1486,7 +1564,7 @@ class CybotController:
                         "goal": None if goal is None else {"x": goal[0], "y": goal[1]},
                         "pose": {"x": round(pose.x, 3), "y": round(pose.y, 3),
                                  "heading_deg": round(pose.heading, 2)},
-                        "advice": "Obstacle recorded. Scan and replan before moving again.",
+                        "advice": "Back up 5-10 cm first, then scan and replan; a nearby object can block the scan.",
                     }
                 with self.state.lock:
                     if self.state.route.points:
@@ -1555,6 +1633,9 @@ class CybotController:
             with self.state.lock:
                 self.state.map.clear()
                 self.state.last_scan = []
+                self.state.last_scan_landmarks = []
+                self.state.last_scan_pose = None
+                self.state.last_scan_turn = -1
                 if self.state.goal is not None:
                     pos = self.state.pose
                     self.state.route = self.state.map.plan(
@@ -1563,7 +1644,57 @@ class CybotController:
                 else:
                     self.state.route = Route()
             self._dirty()
-            return {"ok": True, "obstacles": 0}
+            return {"ok": True, "obstacles": 0,
+                    "turn_count": self.turn_count}
+
+    def play_song(self, song: Any = SONG_FUNKYTOWN) -> dict[str, Any]:
+        if isinstance(song, str):
+            key = song.strip().lower()
+            if key in ("rango", "0"):
+                index = SONG_RANGO
+            elif key in ("funkytown", "funky", "1"):
+                index = SONG_FUNKYTOWN
+            else:
+                return {"ok": False, "error": f"unknown song {song!r}"}
+        elif isinstance(song, bool):
+            return {"ok": False, "error": "song must be a name or index"}
+        else:
+            try:
+                index = int(song)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "song must be a name or index"}
+        if index not in SONG_NAMES:
+            return {"ok": False, "error": "song index must be 0 or 1"}
+        with self.cmd_lock:
+            try:
+                response = self.link.send(f"o {index}")
+            except CybotLinkError as exc:
+                self._link_failed(str(exc))
+                return {"ok": False, "error": str(exc)}
+            return {
+                "ok": True,
+                "song": SONG_NAMES[index],
+                "index": index,
+                "response": response.replace("\n", " | "),
+            }
+
+    def remove_objects(self, ids: list[int]) -> dict[str, Any]:
+        with self.cmd_lock:
+            with self.state.lock:
+                removed, ignored = self.state.map.remove_ids(ids)
+                self.state.last_scan_landmarks = []
+                self.state.last_scan = []
+                self.state.last_scan_pose = None
+                self.state.last_scan_turn = -1
+                if self.state.goal is not None:
+                    pos = self.state.pose
+                    self.state.route = self.state.map.plan(
+                        (pos.x, pos.y), self.state.goal
+                    )
+                remaining = len(self.state.map.obstacles)
+            self._dirty()
+            return {"ok": True, "removed": removed, "ignored": ignored,
+                    "remaining": remaining, "turn_count": self.turn_count}
 
     def _link_failed(self, message: str) -> None:
         with self.state.lock:
@@ -1585,7 +1716,8 @@ class CybotController:
                          "heading_deg": round(pose.heading, 2)},
                 "goal": None if goal is None else {"x": goal[0], "y": goal[1]},
                 "route": route,
-                "obstacles": self.state.map.snapshot(40),
+                "motion_turn": self.turn_count,
+                "obstacles": self.state.map.snapshot(40, self.turn_count),
                 "obstacle_count": len(self.state.map.obstacles),
                 "last_scan": {
                     "detections": len(self.state.last_scan),
@@ -1611,9 +1743,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "get_status",
             "description": (
-                "Read the current pose, goal, route, mapped obstacles and last "
-                "localization correction. Call this at the start of a task or "
-                "after an unexpected result."
+                "Read pose, goal, route, motion_turn, and mapped obstacles. Each "
+                "obstacle has id, kind, hits, added_turn, updated_turn and "
+                "age_turns. age_turns counts moves/turns since it was added; "
+                "large ages mean the position is probably stale because of "
+                "encoder drift. Call this at the start of a task or after an "
+                "unexpected result."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -1624,9 +1759,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "scan",
             "description": (
                 "Run a full 180-degree IR scan. Returns detected objects "
-                "(servo angle, surface distance in cm, width in cm), updates the "
-                "obstacle map and applies scan-based localization that corrects "
-                "encoder drift."
+                "(servo angle, surface distance in cm, width in cm), applies "
+                "scan-based localization, and refreshes the viewed sector: old "
+                "scan-derived obstacles there are replaced, while bump/hole/"
+                "boundary contacts are kept. Repeated scans from the same pose "
+                "average the position and size of re-seen objects. Back up "
+                "5-10 cm after a contact before scanning."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -1634,13 +1772,48 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "survey",
+            "name": "remove_objects",
             "description": (
-                "Map all around the robot: eight scans separated by 45-degree "
-                "turns (large overlap between scans), then return to the "
-                "starting heading. This is slow but measures and trims turn "
-                "encoder error, places landmarks on every side, and is the best "
-                "way to correct accumulated drift. Use at the start of a task."
+                "Delete one or more mapped objects by id (ids come from "
+                "get_status). Use this for stale objects whose age_turns is high "
+                "or whose position no longer matches the room. Invalid ids are "
+                "ignored; the call never crashes. Contact objects (bump/hole/"
+                "boundary) can also be removed this way. The route is replanned."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "obstacle ids to delete",
+                    }
+                },
+                "required": ["ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_map",
+            "description": (
+                "Delete every mapped object (obstacles, bumps, holes, "
+                "boundaries) and replan. Use only when the map is too corrupted "
+                "to repair object-by-object. The human operator has the same "
+                "'Clear all' button."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish_sound",
+            "description": (
+                "Play the completion jingle (Funkytown) after the task is truly "
+                "complete. Call it at most once per task, after the final motion "
+                "and before the summary. It does not perform any navigation."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -1652,8 +1825,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "Drive straight. Positive distance_cm = forward, negative = "
                 "backward. Firmware stops on bump/hole/boundary and reports the "
-                "event and remaining distance. Maximum magnitude 500 cm; prefer "
-                "short legs (<= 50 cm) while exploring."
+                "event and remaining distance. After a contact, back up 5-10 cm "
+                "before scanning so the object does not corrupt the scan. Maximum "
+                "magnitude 500 cm; prefer short legs (<= 50 cm) while exploring."
             ),
             "parameters": {
                 "type": "object",
@@ -1726,7 +1900,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "raw_command",
             "description": (
                 "Send a raw firmware command without the trailing newline, for "
-                "example 'p' (ping), 'o 3' (song) or 'f' (flush). m/t/s are "
+                "example 'p' (ping), 'o 0' (Rango), 'o 1' (Funkytown) or "
+                "'f' (flush). m/t/s are "
                 "routed through the typed tools so the map stays consistent. "
                 "z is blocked because it shuts down the firmware loop."
             ),
@@ -1762,8 +1937,33 @@ class ToolRuntime:
                 return self.controller.status()
             if name == "scan":
                 return self.controller.scan()
-            if name == "survey":
-                return self.controller.survey()
+            if name == "finish_sound":
+                result = self.controller.play_song(SONG_FUNKYTOWN)
+                result["finish"] = True
+                return result
+            if name == "remove_objects":
+                raw = args.get("ids")
+                if raw is None:
+                    raw = args.get("objects")
+                if raw is None:
+                    raw = args.get("object_ids")
+                if raw is None:
+                    return {"ok": False, "error": "ids is required"}
+                if not isinstance(raw, list):
+                    raw = [raw]
+                ids: list[int] = []
+                for item in raw:
+                    if isinstance(item, dict):
+                        item = item.get("id")
+                    if isinstance(item, bool):
+                        continue
+                    try:
+                        ids.append(int(item))
+                    except (TypeError, ValueError):
+                        continue
+                return self.controller.remove_objects(ids)
+            if name == "clear_map":
+                return self.controller.clear_map()
             if name == "move":
                 distance = args.get("distance_cm")
                 if isinstance(distance, bool) or not isinstance(distance, (int, float)):
@@ -2021,24 +2221,41 @@ COORDINATES AND UNITS
 - Field limits are |x|, |y| <= 2.9 m.
 - move: centimetres, positive forward. turn: degrees, positive counter-clockwise.
 - Pose is dead-reckoned and noisy. Every scan matches detected landmarks
-  against the obstacle map and corrects accumulated encoder error, so scan
-  often. Treat the pose as approximate (+/- 10 cm even after correction).
+  against the map and corrects some encoder error, but this is only partial.
+
+MAP AGING AND STALE OBJECTS
+- Every successful move or turn increments motion_turn. Every obstacle from
+  get_status has: id, kind, hits, added_turn, updated_turn and age_turns.
+- The encoders drift. An object that is several movements old (age_turns >= 3)
+  is probably no longer drawn where it really is. Do not trust old objects for
+  tight routes. Re-scan the area before relying on one, or delete it with
+  remove_objects(ids=[...]).
+- remove_objects can delete several ids in one call. Invalid ids are ignored and
+  never crash. clear_map deletes every object; the human has the same button.
+- kind "bump", "hole" and "boundary" are direct contact evidence. A scan never
+  erases them; only remove_objects or clear_map can.
+- A scan refreshes the 180-degree sector in front of the robot: scan-derived
+  objects in that sector that are no longer seen are removed, and new detections
+  are added. Repeated scans from the same pose average position and size.
+- After bump/hole/boundary, back up 5-10 cm (move a negative distance) before
+  scanning. An object right at the bumper blocks or distorts the scan.
 
 HOW TO WORK
 1. Call get_status at the start of a task and after any surprise.
 2. To travel: set_goal(x, y), then follow_path(). Inspect the returned event.
-   On bump/hole/boundary, do NOT repeat the same move: scan, look at the new
-   map, then set_goal again to replan.
+   On a contact, do NOT repeat the same move: back up 5-10 cm, scan, remove any
+   phantom objects that box you in, then set_goal again to replan.
 3. While exploring, use short move legs (<= 50 cm) and scans. A scan only sees
    about 65 cm, so absence of detections is not proof that space is clear.
-   If the map is sparse or heading drift is likely, call survey once; it scans
-   at 45-degree steps and trims turn error from overlapping landmarks.
 4. follow_path executes known-clear waypoints. It stops immediately on contact.
-5. Use raw_command for ping ('p'), song ('o 3'), flush ('f') or other firmware
-   commands. m/t/s are routed through typed tools so the map stays consistent.
-   'z' is blocked because it shuts down the firmware loop.
+5. Use raw_command for ping ('p'), songs ('o 0' = Rango, 'o 1' = Funkytown),
+   flush ('f') or other firmware commands. m/t/s are routed through typed tools
+   so the map stays consistent. 'z' is blocked because it shuts down the
+   firmware loop.
 6. Never claim to have moved or observed something without a tool result.
 7. If a tool reports ok=false, explain the failure and recover safely.
+8. When the task is genuinely finished, call finish_sound once (Funkytown),
+   then give the final summary. Do not use it to pretend a task succeeded.
 
 STYLE
 - Before tools, state the intent in one or two short sentences.
@@ -2076,6 +2293,7 @@ class AgentRunner:
             "route_waypoints": len(status.get("route", {}).get("waypoints", [])),
             "route_m": status.get("route", {}).get("distance_m"),
             "obstacles": status.get("obstacle_count"),
+            "motion_turn": status.get("motion_turn"),
             "last_event": status.get("last_event"),
             "last_correction": status.get("last_scan", {}).get("correction"),
             "mode": status.get("mode"),
@@ -2375,13 +2593,28 @@ class CyBotApp:
             ("▼ 25cm", lambda: self._manual_move(-25), 7),
             ("⟳ 30°", lambda: self._manual_turn(-30), 7),
             ("Scan", self._manual_scan, 7),
-            ("Survey", self._manual_survey, 7),
             ("Flush", self._manual_flush, 7),
-            ("Clear map", self._clear_map, 9),
+            ("Clear all", self._clear_map, 9),
         ):
             b = ttk.Button(drive, text=text, width=width, command=cmd)
             b.pack(side="left", padx=(0, 3))
             self.drive_buttons.append(b)
+
+        music = tk.Frame(left, bg=C["panel"])
+        music.pack(fill="x", padx=8, pady=(0, 5))
+        tk.Label(music, text="Song", bg=C["panel"], fg=C["dim"],
+                 font=FONT_SMALL).pack(side="left")
+        self.song_var = tk.StringVar(value=SONG_NAMES[SONG_RANGO])
+        self.song_box = ttk.Combobox(
+            music, textvariable=self.song_var, width=14, state="readonly",
+            values=(SONG_NAMES[SONG_RANGO], SONG_NAMES[SONG_FUNKYTOWN]),
+        )
+        self.song_box.pack(side="left", padx=(6, 6))
+        self.song_btn = ttk.Button(music, text="Play", width=8,
+                                   command=self._manual_song)
+        self.song_btn.pack(side="left")
+        self.drive_buttons.append(self.song_btn)
+
         tk.Label(left, text="Keys: W/S forward/back · A/D turn · Space scan",
                  bg=C["panel"], fg=C["faint"], font=FONT_SMALL).pack(pady=(0, 6))
 
@@ -2946,7 +3179,9 @@ class CyBotApp:
             "The model drives through tools; you can stop it any time.\n"
             "• Click the field to set an A* goal, then 'AI: go to goal'.\n"
             "• Manual keys: W/S, A/D, Space. Use Scan to refresh the map.\n"
-            "• Every scan also re-localizes the robot against mapped obstacles.\n",
+            "• Every scan refreshes the viewed area and re-localizes the robot.\n"
+            "• Stale objects can be removed by the model by id; Clear all wipes the map.\n"
+            "• After a bump/hole, back up 5-10 cm before scanning.\n",
             "notice",
         )
         self.chat_text.configure(state="disabled")
@@ -3117,10 +3352,16 @@ class CyBotApp:
             controller = self.controller
             self._manual("scan", controller.scan)
 
-    def _manual_survey(self) -> None:
-        if self.controller is not None:
-            controller = self.controller
-            self._manual("survey", controller.survey)
+    def _manual_song(self) -> None:
+        if self.controller is None:
+            self._chat_notice("Connect first.")
+            return
+        if self.agent_busy or self.manual_busy:
+            return
+        controller = self.controller
+        song = self.song_var.get()
+        self._chat_notice(f"Playing {song}.")
+        self._manual("song", lambda: controller.play_song(song))
 
     def _manual_flush(self) -> None:
         if self.controller is not None:
@@ -3136,7 +3377,7 @@ class CyBotApp:
             return
         self.controller.clear_map()
         self._map_dirty = True
-        self._chat_notice("Obstacle map cleared; pose kept.")
+        self._chat_notice("All mapped objects cleared; pose kept.")
 
     def _send_raw(self) -> None:
         command = self.raw_var.get().strip()
@@ -3202,6 +3443,9 @@ class CyBotApp:
                 button.state(["disabled"])
             else:
                 button.state(["!disabled"])
+        self.song_box.configure(
+            state="disabled" if (busy or not connected) else "readonly"
+        )
         if busy or not connected:
             self.send_btn.state(["disabled"])
             self.raw_entry.state(["disabled"])
@@ -3359,6 +3603,12 @@ class CyBotApp:
             elif kind == "boundary":
                 canvas.create_oval(px - rp, py - rp, px + rp, py + rp,
                                    fill="#2a0710", outline="#ff8098", width=1)
+            elif kind == "bump":
+                halo = (r + ROBOT_RADIUS) * PPM
+                canvas.create_oval(px - halo, py - halo, px + halo, py + halo,
+                                   outline="#4a2a12", width=1)
+                canvas.create_oval(px - rp, py - rp, px + rp, py + rp,
+                                   fill=C["orange"], outline="#ffd6a5", width=1)
             else:
                 halo = (r + ROBOT_RADIUS) * PPM
                 canvas.create_oval(px - halo, py - halo, px + halo, py + halo,
@@ -3439,7 +3689,7 @@ class CyBotApp:
         canvas.create_text(sx0 + PPM / 2, sy0 - 8, text="1 m", fill=C["dim"],
                            font=FONT_SMALL)
         canvas.create_text(w - 10, 16, anchor="ne",
-                           text="● obstacle   ○ hole   route ┅   ● robot",
+                           text="● obstacle   ● bump   ○ hole   route ┅   ● robot",
                            fill=C["faint"], font=FONT_SMALL)
 
         if self.controller is None:

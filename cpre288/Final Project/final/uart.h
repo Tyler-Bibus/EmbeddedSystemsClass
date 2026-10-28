@@ -17,11 +17,17 @@
 #include "Timer.h"
 #include <inc/tm4c123gh6pm.h>
 
+#define UART_RX_BUFFER_SIZE 64
+
 void uart_init(void);
 
 void uart_sendChar(char data);
 
 char uart_receive(void);
+
+int uart_available(void);
+
+char uart_getchar(void);
 
 void uart_sendStr(const char *data);
 

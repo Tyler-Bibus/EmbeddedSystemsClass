@@ -71,11 +71,20 @@ void TIMER3B_Handler(void){
 }
 
 unsigned int ping_read(void) {
+    unsigned long guard = 0;
     send_pulse(); //request PING
 
-    while(state != DONE){}
+    // Do not hang the whole scan if the echo never returns.
+    while (state != DONE && guard++ < 10000000UL){}
+
+    if (state != DONE){
+        return 0xFFFFFF; // no echo; caller treats this as out of range
+    }
 
     if (falling_time > rising_time){
+        // NOTE: TBPS+TBR is captured as a 24-bit value here, while this
+        // adds a 16-bit wrap constant; verify on hardware before trusting
+        // distances that cross a timer wrap.
         rising_time += 0xFFFF;
         overflow_count++;
     }

@@ -13,12 +13,16 @@
 #include "uart.h"
 #include "timer.h"
 
-volatile  char uart_data;  // Your UART interupt code can place read data here
-volatile  char uart_flag;       // Your UART interupt can update this flag
-                           // to indicate that it has placed new data
-                           // in uart_data
+/* Ring buffer written by the RX ISR and read by the command parser.  The
+ * previous single-byte uart_data/uart_flag pair could lose a byte if a new
+ * interrupt arrived while the main loop was copying the last one. */
+volatile unsigned char uart_rx_buffer[UART_RX_BUFFER_SIZE];
+volatile unsigned int uart_rx_head = 0;
+volatile unsigned int uart_rx_tail = 0;
 
 void uart_init(void){
+    uart_rx_head = 0;
+    uart_rx_tail = 0;
     SYSCTL_RCGCGPIO_R |= 0b0010;      // enable clock GPIOB (page 340)
     SYSCTL_RCGCUART_R |= 0b0010;      // enable clock UART1 (page 344)
     GPIO_PORTB_AFSEL_R |= 0b0011;      // sets PB0 and PB1 as peripherals (page 671
@@ -51,11 +55,26 @@ void uart_sendChar(char data){
 
 char uart_receive(void){
 	char data = 0;
-	while (!(UART1_FR_R & 0x80)){
+	// Wait while the receive FIFO is empty (RXFE, bit 4), not TXFE.
+	while ((UART1_FR_R & 0x10)){
 	    //wait...
 	}
 	data = (char)(UART1_DR_R & 0xFF);
 	return data;
+}
+
+int uart_available(void){
+    return uart_rx_head != uart_rx_tail;
+}
+
+char uart_getchar(void){
+    char data;
+    while (!uart_available()){
+        // wait for a complete byte from the RX interrupt
+    }
+    data = (char)uart_rx_buffer[uart_rx_tail];
+    uart_rx_tail = (uart_rx_tail + 1) % UART_RX_BUFFER_SIZE;
+    return data;
 }
 
 void uart_sendStr(const char *data){
@@ -69,14 +88,14 @@ void init_char_interrupt(){
     //clear itr flags
     UART1_ICR_R |= 0b1011111110010;
 
-    //enable send recieve intr
-    UART1_IM_R |= 0b110000;
+    //enable receive interrupt only; TX is polled in uart_sendChar
+    UART1_IM_R |= 0b010000;
 
     //set priority
     NVIC_PRI1_R |= 0x00200000;
 
-    //enable NVIC for uart1 (page 104)
-    NVIC_EN0_R |= 0x00000058;
+    //enable NVIC for uart1 (IRQ 6 = bit 6)
+    NVIC_EN0_R |= 0x00000040;
 
     IntRegister(INT_UART1, UART1_Handler);
 
@@ -87,15 +106,22 @@ void init_char_interrupt(){
 }
 
 void UART1_Handler(){
+    unsigned int next;
     //received byte
     if (UART1_MIS_R & 0b10000){
-        uart_data = uart_receive();
-        uart_flag = 1;
+        next = (uart_rx_head + 1) % UART_RX_BUFFER_SIZE;
+        // If the ring is full, drop the byte rather than corrupting queued data.
+        if (next != uart_rx_tail){
+            uart_rx_buffer[uart_rx_head] = (unsigned char)uart_receive();
+            uart_rx_head = next;
+        }
+        else{
+            (void)uart_receive();
+        }
         UART1_ICR_R |= 0b10000;
     }
-    //transmit byte NOT USED LIKE EVER (i think)
-    if(UART1_MIS_R & 0b100000){
-        //idfk
+    // No TX interrupt is enabled; TX is polled in uart_sendChar.
+    if (UART1_MIS_R & 0b100000){
         UART1_ICR_R |= 0b100000;
     }
 }
